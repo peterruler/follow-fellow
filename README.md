@@ -243,6 +243,33 @@ pytest --cov=follow_fellow --cov-report=term-missing -v
 - 🔍 Erweiterte Filter-Optionen
 - 💾 Datenbank-Integration für historische Daten
 
+## 🤝 Contributing
+
+Beiträge sind willkommen! Bitte lesen Sie unsere [TESTING.md](./TESTING.md) für Entwicklungsrichtlinien.
+
+1. Fork das Repository
+2. Erstellen Sie einen Feature-Branch (`git checkout -b feature/AmazingFeature`)
+3. Committen Sie Ihre Änderungen (`git commit -m 'Add some AmazingFeature'`)
+4. Pushen Sie zum Branch (`git push origin feature/AmazingFeature`)
+5. Öffnen Sie einen Pull Request
+
+## 📄 Lizenz
+
+Dieses Projekt steht unter der MIT-Lizenz - siehe die [LICENSE](LICENSE) Datei für Details.
+
+## 👨‍💻 Autor
+
+**Peter Ströβler** ([@peterruler](https://github.com/peterruler))
+
+- GitHub: [@peterruler](https://github.com/peterruler)
+- Repository: [follow-fellow](https://github.com/peterruler/follow-fellow)
+
+## 🙏 Danksagungen
+
+- Danke an die GitHub API für die umfassenden Endpunkte
+- Inspiriert von der Notwendigkeit, GitHub-Follows effizient zu verwalten
+- Community-Feedback für kontinuierliche Verbesserungen
+
 ---
 
 **Viel Spaß beim Verwalten Ihrer GitHub-Follows! 🚀**

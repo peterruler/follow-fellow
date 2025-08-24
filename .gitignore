@@ -62,3 +62,12 @@ coverage.xml
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# API Cache (Follow-Fellow specific)
+.cache/
+*.cache
+
+# Project specific temporary files
+follow_fellow_clean.py
+temp_*
+backup_*
