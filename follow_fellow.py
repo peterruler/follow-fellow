@@ -8,8 +8,11 @@ import os
 import sys
 import json
 import time
-from typing import List, Dict, Set, Tuple
-from datetime import datetime
+import hashlib
+import pickle
+from typing import List, Dict, Set, Tuple, Optional, Any
+from datetime import datetime, timedelta
+from functools import wraps
 
 import requests
 import click
@@ -18,6 +21,122 @@ from dotenv import load_dotenv
 
 # Lade Umgebungsvariablen
 load_dotenv()
+
+class APICache:
+    """Einfacher File-basierter Cache für API-Responses"""
+    
+    def __init__(self, cache_dir: str = ".cache", cache_ttl_minutes: int = 30):
+        self.cache_dir = cache_dir
+        self.cache_ttl = timedelta(minutes=cache_ttl_minutes)
+        self._ensure_cache_dir()
+    
+    def _ensure_cache_dir(self):
+        """Erstelle Cache-Verzeichnis falls es nicht existiert"""
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir)
+    
+    def _get_cache_key(self, url: str, params: Dict = None) -> str:
+        """Generiere Cache-Key aus URL und Parametern"""
+        key_data = f"{url}_{json.dumps(params or {}, sort_keys=True)}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    def _get_cache_path(self, cache_key: str) -> str:
+        """Erstelle Cache-Dateipfad"""
+        return os.path.join(self.cache_dir, f"{cache_key}.cache")
+    
+    def get(self, url: str, params: Dict = None) -> Optional[Any]:
+        """Hole Daten aus Cache falls verfügbar und nicht abgelaufen"""
+        cache_key = self._get_cache_key(url, params)
+        cache_path = self._get_cache_path(cache_key)
+        
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            # Prüfe Ablaufzeit
+            file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+            if datetime.now() - file_time > self.cache_ttl:
+                os.remove(cache_path)
+                return None
+            
+            # Lade gecachte Daten
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except (OSError, pickle.PickleError, EOFError):
+            # Cache-Datei korrupt, lösche sie
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+            return None
+    
+    def set(self, url: str, data: Any, params: Dict = None):
+        """Speichere Daten im Cache"""
+        cache_key = self._get_cache_key(url, params)
+        cache_path = self._get_cache_path(cache_key)
+        
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(data, f)
+        except (OSError, pickle.PickleError):
+            # Cache-Fehler ignorieren, nicht kritisch
+            pass
+    
+    def clear(self):
+        """Lösche alle Cache-Dateien"""
+        try:
+            for filename in os.listdir(self.cache_dir):
+                if filename.endswith('.cache'):
+                    os.remove(os.path.join(self.cache_dir, filename))
+        except OSError:
+            pass
+
+class RetryStrategy:
+    """Retry-Mechanismus für API-Calls mit Exponential Backoff"""
+    
+    def __init__(self, max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 60.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+    
+    def retry_with_backoff(self, func):
+        """Decorator für Retry-Mechanismus mit Exponential Backoff"""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(self.max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except requests.exceptions.RequestException as e:
+                    last_exception = e
+                    
+                    # Letzter Versuch, gib Exception weiter
+                    if attempt == self.max_retries:
+                        break
+                    
+                    # Berechne Delay mit Exponential Backoff
+                    delay = min(self.base_delay * (2 ** attempt), self.max_delay)
+                    
+                    # Spezielle Behandlung für Rate Limit Errors
+                    if hasattr(e, 'response') and e.response is not None:
+                        if e.response.status_code == 429:  # Rate Limit
+                            retry_after = e.response.headers.get('Retry-After')
+                            if retry_after:
+                                delay = min(int(retry_after), self.max_delay)
+                        elif e.response.status_code >= 500:  # Server Error
+                            pass  # Verwende berechneten Delay
+                        else:
+                            # Client Error (4xx), nicht retry-fähig
+                            break
+                    
+                    print(f"   🔄 Retry {attempt + 1}/{self.max_retries} nach {delay:.1f}s... ({type(e).__name__})")
+                    time.sleep(delay)
+            
+            # Alle Versuche fehlgeschlagen
+            raise last_exception
+        
+        return wrapper
 
 app = Flask(__name__)
 
@@ -42,10 +161,36 @@ class GitHubFollowManager:
         self.last_rate_limit_remaining = None
         self.last_rate_limit_total = None
         self.last_rate_limit_reset = None
+        
+        # Caching und Retry-Mechanismus
+        self.cache = APICache(cache_ttl_minutes=int(os.getenv('CACHE_TTL_MINUTES', 30)))
+        self.retry_strategy = RetryStrategy(
+            max_retries=int(os.getenv('MAX_RETRIES', 3)),
+            base_delay=float(os.getenv('RETRY_BASE_DELAY', 1.0)),
+            max_delay=float(os.getenv('RETRY_MAX_DELAY', 60.0))
+        )
+        
+        # Error tracking
+        self.error_count = 0
+        self.max_errors = int(os.getenv('MAX_ERRORS', 10))
     
-    def _make_request(self, url: str, method: str = "GET", **kwargs) -> requests.Response:
-        """Macht eine API-Anfrage mit Rate Limiting. GitHub Rate Limit hat Vorrang vor MAX_API_REQUESTS."""
-        try:
+    def _make_request_with_cache(self, url: str, method: str = "GET", use_cache: bool = True, **kwargs) -> requests.Response:
+        """Macht eine API-Anfrage mit Caching und Retry-Mechanismus"""
+        
+        # Prüfe Cache für GET-Requests
+        if method == "GET" and use_cache:
+            cached_response = self.cache.get(url, kwargs.get('params'))
+            if cached_response is not None:
+                print(f"   💾 Cache Hit für {url.replace(self.base_url, '')}")
+                return cached_response
+        
+        # Prüfe Error-Limit
+        if self.error_count >= self.max_errors:
+            raise RuntimeError(f"❌ Maximale Anzahl von Fehlern erreicht ({self.max_errors}). Vorgang abgebrochen.")
+        
+        # Verwende Retry-Mechanismus
+        @self.retry_strategy.retry_with_backoff
+        def make_api_call():
             response = self.session.request(method, url, **kwargs)
             self.request_count += 1
             
@@ -83,11 +228,90 @@ class GitHubFollowManager:
             
             response.raise_for_status()
             return response
+        
+        try:
+            response = make_api_call()
+            
+            # Cache erfolgreiche GET-Responses
+            if method == "GET" and use_cache and response.status_code == 200:
+                self.cache.set(url, response, kwargs.get('params'))
+            
+            # Reset Error-Count bei erfolgreichem Request
+            self.error_count = 0
+            
+            return response
+            
         except requests.exceptions.RequestException as e:
-            print(f"❌ API-Fehler bei Request #{self.request_count}: {e}")
+            self.error_count += 1
+            error_msg = f"API-Fehler bei Request #{self.request_count} (Fehler #{self.error_count}): {e}"
+            
+            # Detaillierte Fehlerbehandlung
             if hasattr(e, 'response') and e.response is not None:
-                print(f"Response: {e.response.text}")
+                status_code = e.response.status_code
+                if status_code == 401:
+                    error_msg += " - Authentifizierung fehlgeschlagen. Prüfe GitHub Token."
+                elif status_code == 403:
+                    if 'rate limit' in str(e).lower():
+                        error_msg += " - Rate Limit erreicht. Warte auf Reset."
+                    else:
+                        error_msg += " - Zugriff verweigert. Prüfe Token-Berechtigung."
+                elif status_code == 404:
+                    error_msg += " - Ressource nicht gefunden."
+                elif status_code >= 500:
+                    error_msg += " - GitHub Server-Fehler. Retry wird versucht."
+                
+                print(f"❌ {error_msg}")
+                if e.response.text:
+                    try:
+                        error_json = e.response.json()
+                        if 'message' in error_json:
+                            print(f"   GitHub API: {error_json['message']}")
+                    except (json.JSONDecodeError, ValueError):
+                        print(f"   Response: {e.response.text[:200]}")
+            else:
+                print(f"❌ {error_msg}")
+            
             raise
+    
+    def _make_request(self, url: str, method: str = "GET", **kwargs) -> requests.Response:
+        """Wrapper für backward compatibility"""
+        return self._make_request_with_cache(url, method, **kwargs)
+    
+    def clear_cache(self):
+        """Lösche den API-Cache"""
+        self.cache.clear()
+        print("🗑️  API-Cache geleert")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Statistiken über Cache-Nutzung"""
+        cache_files = 0
+        total_size = 0
+        
+        try:
+            if os.path.exists(self.cache.cache_dir):
+                for filename in os.listdir(self.cache.cache_dir):
+                    if filename.endswith('.cache'):
+                        cache_files += 1
+                        file_path = os.path.join(self.cache.cache_dir, filename)
+                        total_size += os.path.getsize(file_path)
+        except OSError:
+            pass
+        
+        return {
+            'cache_files': cache_files,
+            'total_size_bytes': total_size,
+            'total_size_mb': round(total_size / (1024 * 1024), 2),
+            'cache_ttl_minutes': self.cache.cache_ttl.total_seconds() / 60
+        }
+    
+    def get_error_stats(self) -> Dict[str, Any]:
+        """Statistiken über aufgetretene Fehler"""
+        return {
+            'error_count': self.error_count,
+            'max_errors': self.max_errors,
+            'error_rate': round((self.error_count / max(self.request_count, 1)) * 100, 2),
+            'requests_made': self.request_count
+        }
     
     def get_request_status(self) -> Dict:
         """Gibt den aktuellen Request-Status zurück."""
@@ -337,6 +561,8 @@ def index():
                 <button class="btn btn-danger" onclick="performCleanup(true)">🧹 Dry Run (Simulation)</button>
                 <button class="btn btn-danger" onclick="performCleanup(false)">⚠️ Einseitige Follows entfernen</button>
                 <button class="btn" onclick="loadStatus()">📊 Request-Status</button>
+                <button class="btn" onclick="loadCacheStats()">💾 Cache-Statistiken</button>
+                <button class="btn btn-warning" onclick="clearCache()">🗑️ Cache löschen</button>
             </div>
             
             <div style="background: #e3f2fd; padding: 10px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #2196f3;">
@@ -557,6 +783,77 @@ def index():
             function hideLoading() {
                 document.getElementById('loading').classList.add('hidden');
             }
+            
+            async function loadCacheStats() {
+                showLoading();
+                try {
+                    const response = await fetch('/api/cache/stats');
+                    const data = await response.json();
+                    displayCacheStats(data);
+                    hideLoading();
+                } catch (error) {
+                    hideLoading();
+                    alert('Fehler beim Laden der Cache-Statistiken: ' + error.message);
+                }
+            }
+            
+            async function clearCache() {
+                if (!confirm('Sind Sie sicher, dass Sie den Cache löschen möchten? Dies wird alle gespeicherten API-Responses entfernen.')) {
+                    return;
+                }
+                
+                showLoading();
+                try {
+                    const response = await fetch('/api/cache/clear', { method: 'POST' });
+                    const data = await response.json();
+                    alert('Cache erfolgreich geleert! ' + data.cleared_files + ' Dateien entfernt (' + data.freed_space_mb + ' MB)');
+                    hideLoading();
+                } catch (error) {
+                    hideLoading();
+                    alert('Fehler beim Löschen des Caches: ' + error.message);
+                }
+            }
+            
+            function displayCacheStats(data) {
+                var resultsHtml = '<div class="stats-display">';
+                resultsHtml += '<h2>💾 Cache & Performance Statistiken</h2>';
+                
+                // Cache-Statistiken
+                resultsHtml += '<div style="background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #4caf50;">';
+                resultsHtml += '<h3>📦 Cache-Status</h3>';
+                resultsHtml += '<p><strong>Cache-Dateien:</strong> ' + data.cache.cache_files + '</p>';
+                resultsHtml += '<p><strong>Größe:</strong> ' + data.cache.total_size_mb + ' MB (' + data.cache.total_size_bytes + ' Bytes)</p>';
+                resultsHtml += '<p><strong>Cache-TTL:</strong> ' + data.cache.cache_ttl_minutes + ' Minuten</p>';
+                resultsHtml += '</div>';
+                
+                // Error-Statistiken
+                resultsHtml += '<div style="background: #fff3e0; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #ff9800;">';
+                resultsHtml += '<h3>⚠️ Fehler-Statistiken</h3>';
+                resultsHtml += '<p><strong>Fehler-Anzahl:</strong> ' + data.errors.error_count + ' / ' + data.errors.max_errors + '</p>';
+                resultsHtml += '<p><strong>Fehler-Rate:</strong> ' + data.errors.error_rate + '%</p>';
+                resultsHtml += '<p><strong>Requests gemacht:</strong> ' + data.errors.requests_made + '</p>';
+                resultsHtml += '</div>';
+                
+                // Performance-Statistiken
+                resultsHtml += '<div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #2196f3;">';
+                resultsHtml += '<h3>📊 Performance</h3>';
+                resultsHtml += '<p><strong>API-Requests:</strong> ' + data.performance.requests_made + ' / ' + data.performance.max_requests + '</p>';
+                resultsHtml += '<p><strong>Auslastung:</strong> ' + data.performance.usage_percentage + '%</p>';
+                
+                var progressBarColor = 'green';
+                if (data.performance.usage_percentage > 70) progressBarColor = 'orange';
+                if (data.performance.usage_percentage > 90) progressBarColor = 'red';
+                
+                resultsHtml += '<div style="background: #f0f0f0; height: 20px; border-radius: 10px; overflow: hidden;">';
+                resultsHtml += '<div style="width: ' + data.performance.usage_percentage + '%; height: 100%; background: ' + progressBarColor + '; transition: width 0.3s;"></div>';
+                resultsHtml += '</div>';
+                resultsHtml += '</div>';
+                
+                resultsHtml += '</div>';
+                
+                document.getElementById('results').innerHTML = resultsHtml;
+                document.getElementById('results').classList.remove('hidden');
+            }
         </script>
     </body>
     </html>
@@ -667,6 +964,64 @@ def api_cleanup():
             else:
                 return jsonify({'error': str(e)}), 500
                 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/cache/stats')
+def cache_stats():
+    """Cache-Statistiken anzeigen"""
+    try:
+        github_token = os.getenv('GITHUB_TOKEN')
+        if not github_token:
+            return jsonify({'error': 'GitHub Token nicht gefunden'}), 400
+        
+        username = os.getenv('GITHUB_USERNAME', 'peterruler')
+        manager = GitHubFollowManager(username, github_token)
+        
+        cache_stats = manager.get_cache_stats()
+        error_stats = manager.get_error_stats()
+        
+        return jsonify({
+            'cache': cache_stats,
+            'errors': error_stats,
+            'performance': {
+                'requests_made': manager.request_count,
+                'max_requests': manager.max_requests,
+                'usage_percentage': round((manager.request_count / manager.max_requests) * 100, 2)
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/cache/clear', methods=['POST'])
+def clear_cache():
+    """Cache löschen"""
+    try:
+        github_token = os.getenv('GITHUB_TOKEN')
+        if not github_token:
+            return jsonify({'error': 'GitHub Token nicht gefunden'}), 400
+        
+        username = os.getenv('GITHUB_USERNAME', 'peterruler')
+        manager = GitHubFollowManager(username, github_token)
+        
+        # Hole Statistiken vor dem Löschen
+        stats_before = manager.get_cache_stats()
+        
+        # Lösche Cache
+        manager.clear_cache()
+        
+        # Hole Statistiken nach dem Löschen
+        stats_after = manager.get_cache_stats()
+        
+        return jsonify({
+            'message': 'Cache erfolgreich geleert',
+            'cleared_files': stats_before['cache_files'],
+            'freed_space_mb': stats_before['total_size_mb'],
+            'stats_before': stats_before,
+            'stats_after': stats_after
+        })
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
