@@ -33,35 +33,99 @@ class GitHubFollowManager:
         }
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        # Request-Zähler für Limitierung
+        self.request_count = 0
+        self.max_requests = int(os.getenv('MAX_API_REQUESTS', 2500))
+        # User Processing Limit
+        self.max_users_to_process = int(os.getenv('MAX_USERS_TO_PROCESS', 200))
+        # GitHub Rate Limit Tracking
+        self.last_rate_limit_remaining = None
+        self.last_rate_limit_total = None
+        self.last_rate_limit_reset = None
     
     def _make_request(self, url: str, method: str = "GET", **kwargs) -> requests.Response:
-        """Macht eine API-Anfrage mit Rate Limiting."""
+        """Macht eine API-Anfrage mit Rate Limiting. GitHub Rate Limit hat Vorrang vor MAX_API_REQUESTS."""
         try:
             response = self.session.request(method, url, **kwargs)
+            self.request_count += 1
+            
+            # GitHub Rate Limit Informationen aus Response Headers
+            rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
+            rate_limit_total = int(response.headers.get('X-RateLimit-Limit', 0))
+            rate_limit_reset = int(response.headers.get('X-RateLimit-Reset', 0))
+            
+            # Speichere Rate Limit Informationen
+            self.last_rate_limit_remaining = rate_limit_remaining
+            self.last_rate_limit_total = rate_limit_total
+            self.last_rate_limit_reset = rate_limit_reset
+            
+            # Formatiere Reset-Zeit
+            reset_time_str = ""
+            if rate_limit_reset > 0:
+                reset_time = datetime.fromtimestamp(rate_limit_reset)
+                reset_time_str = f" (Reset: {reset_time.strftime('%H:%M:%S')})"
+            
+            # Zeige jeden Request mit Rate Limit Status
+            endpoint = url.replace(self.base_url, "").split('?')[0]  # Bereinige URL für Anzeige
+            print(f"🔄 Request #{self.request_count}/{self.max_requests} -> {method} {endpoint}")
+            print(f"   📊 GitHub Rate Limit: {rate_limit_remaining}/{rate_limit_total}{reset_time_str}")
+            
+            # Rate Limit Warnung
+            if rate_limit_remaining < 100:
+                print(f"   ⚠️  Wenig Rate Limit übrig: {rate_limit_remaining}")
             
             # Rate Limit prüfen
-            remaining = int(response.headers.get('X-RateLimit-Remaining', 0))
-            if remaining < 10:
-                reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
-                wait_time = max(0, reset_time - int(time.time()) + 1)
+            if rate_limit_remaining < 10:
+                wait_time = max(0, rate_limit_reset - int(time.time()) + 1)
                 if wait_time > 0:
-                    print(f"⏳ Rate limit erreicht. Warte {wait_time} Sekunden...")
+                    print(f"   ⏳ Rate limit fast erreicht. Warte {wait_time} Sekunden...")
                     time.sleep(wait_time)
             
             response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
-            print(f"❌ API-Fehler: {e}")
+            print(f"❌ API-Fehler bei Request #{self.request_count}: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 print(f"Response: {e.response.text}")
             raise
     
+    def get_request_status(self) -> Dict:
+        """Gibt den aktuellen Request-Status zurück."""
+        status = {
+            'current_requests': self.request_count,
+            'max_requests': self.max_requests,
+            'remaining_requests': self.max_requests - self.request_count,
+            'usage_percentage': (self.request_count / self.max_requests) * 100,
+            'max_users_to_process': self.max_users_to_process
+        }
+        
+        # Füge GitHub Rate Limit Informationen hinzu, falls verfügbar
+        if self.last_rate_limit_remaining is not None:
+            status['github_rate_limit'] = {
+                'remaining': self.last_rate_limit_remaining,
+                'total': self.last_rate_limit_total,
+                'reset_timestamp': self.last_rate_limit_reset,
+                'reset_time': datetime.fromtimestamp(self.last_rate_limit_reset).strftime('%H:%M:%S') if self.last_rate_limit_reset else None
+            }
+        
+        return status
+    
     def get_all_paginated(self, endpoint: str) -> List[Dict]:
-        """Holt alle Seiten einer paginierten API-Antwort."""
+        """Holt alle Seiten einer paginierten API-Antwort. Nur GitHub Rate Limit wird berücksichtigt."""
         all_items = []
         url = f"{self.base_url}{endpoint}"
         
         while url:
+            # Prüfe GitHub Rate Limit vor jeder Anfrage (nicht MAX_API_REQUESTS)
+            if self.last_rate_limit_remaining is not None and self.last_rate_limit_remaining <= 10:
+                print(f"\n❌ KRITISCHER FEHLER: GITHUB RATE LIMIT ERREICHT!")
+                print("=" * 60)
+                print(f"Das GitHub API Rate Limit ist fast aufgebraucht: {self.last_rate_limit_remaining}")
+                print(f"Paginierten Abruf für {endpoint} wird abgebrochen.")
+                print("Das Programm wird beendet, um API-Missbrauch zu verhindern.")
+                print("=" * 60)
+                break
+                
             response = self._make_request(url)
             data = response.json()
             all_items.extend(data)
@@ -82,6 +146,11 @@ class GitHubFollowManager:
         followers_data = self.get_all_paginated(f"/users/{self.username}/followers")
         followers = {user['login'] for user in followers_data}
         print(f"✅ {len(followers)} Follower gefunden")
+        status = self.get_request_status()
+        print(f"📊 API-Requests verwendet: {status['current_requests']}/{status['max_requests']} ({status['usage_percentage']:.1f}%)")
+        if 'github_rate_limit' in status:
+            rl = status['github_rate_limit']
+            print(f"🔄 GitHub Rate Limit: {rl['remaining']}/{rl['total']} (Reset: {rl['reset_time']})")
         return followers
     
     def get_following(self) -> Set[str]:
@@ -90,6 +159,11 @@ class GitHubFollowManager:
         following_data = self.get_all_paginated(f"/users/{self.username}/following")
         following = {user['login'] for user in following_data}
         print(f"✅ {len(following)} Following gefunden")
+        status = self.get_request_status()
+        print(f"📊 API-Requests verwendet: {status['current_requests']}/{status['max_requests']} ({status['usage_percentage']:.1f}%)")
+        if 'github_rate_limit' in status:
+            rl = status['github_rate_limit']
+            print(f"🔄 GitHub Rate Limit: {rl['remaining']}/{rl['total']} (Reset: {rl['reset_time']})")
         return following
     
     def unfollow_user(self, username: str) -> bool:
@@ -137,9 +211,24 @@ class FollowAnalyzer:
         one_way, mutual, followers, not_following_back = self.analyze_follows()
         following = self.manager.get_following()
         
-        # Detaillierte Infos für einseitige Follows sammeln
+        # Detaillierte Infos für einseitige Follows sammeln (begrenzt auf MAX_USERS_TO_PROCESS)
         one_way_details = []
-        for username in sorted(one_way):
+        one_way_limited = list(sorted(one_way))[:self.manager.max_users_to_process]
+        
+        print(f"📊 Verarbeite {len(one_way_limited)} von {len(one_way)} einseitigen Follows (Limit: {self.manager.max_users_to_process})")
+        
+        for i, username in enumerate(one_way_limited, 1):
+            # Prüfe GitHub Rate Limit vor jeder User-Info-Anfrage (nicht MAX_API_REQUESTS)
+            if self.manager.last_rate_limit_remaining is not None and self.manager.last_rate_limit_remaining <= 10:
+                print(f"\n❌ KRITISCHER FEHLER: GITHUB RATE LIMIT ERREICHT!")
+                print("=" * 60)
+                print(f"Das GitHub API Rate Limit ist fast aufgebraucht: {self.manager.last_rate_limit_remaining}")
+                print(f"Detaillierte User-Infos für verbleibende {len(one_way_limited) - len(one_way_details)} Benutzer werden übersprungen.")
+                print("Das Programm wird beendet, um API-Missbrauch zu verhindern.")
+                print("=" * 60)
+                break
+            
+            print(f"📋 Verarbeite User {i}/{len(one_way_limited)}: {username}")
             user_info = self.manager.get_user_info(username)
             one_way_details.append({
                 'username': username,
@@ -153,9 +242,24 @@ class FollowAnalyzer:
                 'html_url': user_info.get('html_url', '')
             })
         
-        # Detaillierte Infos für nicht zurückgefolgte Follower sammeln
+        # Detaillierte Infos für nicht zurückgefolgte Follower sammeln (begrenzt auf MAX_USERS_TO_PROCESS)
         not_following_back_details = []
-        for username in sorted(not_following_back):
+        not_following_back_limited = list(sorted(not_following_back))[:self.manager.max_users_to_process]
+        
+        print(f"📊 Verarbeite {len(not_following_back_limited)} von {len(not_following_back)} nicht zurückgefolgten Followern (Limit: {self.manager.max_users_to_process})")
+        
+        for i, username in enumerate(not_following_back_limited, 1):
+            # Prüfe GitHub Rate Limit vor jeder User-Info-Anfrage (nicht MAX_API_REQUESTS)
+            if self.manager.last_rate_limit_remaining is not None and self.manager.last_rate_limit_remaining <= 10:
+                print(f"\n❌ KRITISCHER FEHLER: GITHUB RATE LIMIT ERREICHT!")
+                print("=" * 60)
+                print(f"Das GitHub API Rate Limit ist fast aufgebraucht: {self.manager.last_rate_limit_remaining}")
+                print(f"Detaillierte User-Infos für verbleibende {len(not_following_back_limited) - len(not_following_back_details)} Benutzer werden übersprungen.")
+                print("Das Programm wird beendet, um API-Missbrauch zu verhindern.")
+                print("=" * 60)
+                break
+            
+            print(f"📋 Verarbeite User {i}/{len(not_following_back_limited)}: {username}")
             user_info = self.manager.get_user_info(username)
             not_following_back_details.append({
                 'username': username,
@@ -169,9 +273,20 @@ class FollowAnalyzer:
                 'html_url': user_info.get('html_url', '')
             })
         
+        # Request-Status hinzufügen
+        request_status = self.manager.get_request_status()
+        
         return {
             'timestamp': datetime.now().isoformat(),
             'user': self.manager.username,
+            'request_status': request_status,
+            'processing_limits': {
+                'max_users_to_process': self.manager.max_users_to_process,
+                'one_way_total': len(one_way),
+                'one_way_processed': len(one_way_details),
+                'not_following_back_total': len(not_following_back),
+                'not_following_back_processed': len(not_following_back_details)
+            },
             'stats': {
                 'total_followers': len(followers),
                 'total_following': len(following),
@@ -219,8 +334,17 @@ def index():
             
             <div class="actions">
                 <button class="btn" onclick="loadAnalysis()">📊 Analyse durchführen</button>
-                <button class="btn btn-danger" onclick="performCleanup(true)">🧹 Dry Run</button>
-                <button class="btn btn-danger" onclick="performCleanup(false)">⚠️ Cleanup durchführen</button>
+                <button class="btn btn-danger" onclick="performCleanup(true)">🧹 Dry Run (Simulation)</button>
+                <button class="btn btn-danger" onclick="performCleanup(false)">⚠️ Einseitige Follows entfernen</button>
+                <button class="btn" onclick="loadStatus()">📊 Request-Status</button>
+            </div>
+            
+            <div style="background: #e3f2fd; padding: 10px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #2196f3;">
+                <p><strong>ℹ️  Wichtiger Hinweis:</strong> Das Cleanup entfernt nur einseitige Follows (Benutzer, die Ihnen NICHT zurückfolgen). Benutzer, die Ihnen folgen, werden niemals entfolgt.</p>
+            </div>
+            
+            <div id="status-container" class="hidden">
+                <div id="status-display"></div>
             </div>
             
             <div id="loading" class="loading hidden">
@@ -247,8 +371,18 @@ def index():
                 }
             }
 
+            async function loadStatus() {
+                try {
+                    const response = await fetch('/api/status');
+                    const data = await response.json();
+                    displayStatus(data);
+                } catch (error) {
+                    alert('Fehler beim Laden des Status: ' + error.message);
+                }
+            }
+
             async function performCleanup(dryRun) {
-                if (!dryRun && !confirm('Sind Sie sicher, dass Sie das Cleanup durchführen möchten? Dies entfernt alle einseitigen Follows!')) {
+                if (!dryRun && !confirm('Sind Sie sicher, dass Sie einseitige Follows entfernen möchten?\\n\\nWICHTIG: Es werden nur Benutzer entfolgt, die Ihnen NICHT zurückfolgen!\\nBenutzer, die Ihnen folgen, bleiben unberührt.')) {
                     return;
                 }
                 
@@ -268,73 +402,120 @@ def index():
                 }
             }
 
-            function displayResults(data) {
-                const statsHtml = `
-                    <div class="stats">
-                        <div class="stat-card">
-                            <h3>${data.stats.total_followers}</h3>
-                            <p>Follower</p>
-                        </div>
-                        <div class="stat-card">
-                            <h3>${data.stats.total_following}</h3>
-                            <p>Following</p>
-                        </div>
-                        <div class="stat-card">
-                            <h3>${data.stats.mutual_follows}</h3>
-                            <p>Gegenseitig</p>
-                        </div>
-                        <div class="stat-card">
-                            <h3>${data.stats.one_way_follows}</h3>
-                            <p>Einseitig</p>
-                        </div>
-                        <div class="stat-card">
-                            <h3>${data.stats.not_following_back}</h3>
-                            <p>Nicht zurück</p>
-                        </div>
-                    </div>
-                `;
+            function displayStatus(data) {
+                var status = data.status;
+                var progressColor = status.usage_percentage > 80 ? '#f44336' : status.usage_percentage > 60 ? '#ff9800' : '#4caf50';
                 
-                const oneWayHtml = `
-                    <h2>🔍 Einseitige Follows (${data.one_way_follows.length})</h2>
-                    <p>Diese Benutzer folgen Ihnen nicht zurück:</p>
-                    ${data.one_way_follows.map(user => `
-                        <div class="user-card">
-                            <div class="user-header">
-                                <div>
-                                    <h3><a href="${user.html_url}" target="_blank">${user.username}</a></h3>
-                                    ${user.name ? `<p><strong>${user.name}</strong></p>` : ''}
-                                    ${user.bio ? `<p>${user.bio}</p>` : ''}
-                                </div>
-                            </div>
-                            <div class="user-stats">
-                                👥 ${user.followers} Follower | 
-                                📤 ${user.following} Following | 
-                                📂 ${user.public_repos} Repos |
-                                📅 Seit ${new Date(user.created_at).toLocaleDateString('de-DE')}
-                            </div>
-                        </div>
-                    `).join('')}
-                    
-                    <h2>🔄 Follower ohne Rückfolgen (${data.not_following_back.length})</h2>
-                    <p>Diese Benutzer folgen Ihnen, aber Sie folgen ihnen nicht zurück:</p>
-                    ${data.not_following_back.map(user => `
-                        <div class="user-card">
-                            <div class="user-header">
-                                <div>
-                                    <h3><a href="${user.html_url}" target="_blank">${user.username}</a></h3>
-                                    ${user.name ? `<p><strong>${user.name}</strong></p>` : ''}
-                                    ${user.bio ? `<p>${user.bio}</p>` : ''}
-                                </div>
-                            </div>
-                            <div class="user-stats">
-                                👥 ${user.followers} Follower | 
-                                📤 ${user.following} Following | 
-                                📂 ${user.public_repos} Repos |
-                                📅 Seit ${new Date(user.created_at).toLocaleDateString('de-DE')}
-                            </div>
-                        </div>
-                    `).join('')}
-                `;
+                var statusHtml = '<div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2196f3;">';
+                statusHtml += '<h3>📊 API Request Status</h3>';
+                statusHtml += '<p><strong>Verwendete Requests:</strong> ' + status.current_requests + ' / ' + status.max_requests + '</p>';
+                statusHtml += '<p><strong>Verbleibende Requests:</strong> ' + status.remaining_requests + '</p>';
+                statusHtml += '<p><strong>Nutzung:</strong> ' + status.usage_percentage.toFixed(1) + '%</p>';
+                statusHtml += '<div style="background: #fff; border-radius: 4px; overflow: hidden; margin: 10px 0;">';
+                statusHtml += '<div style="width: ' + status.usage_percentage + '%; background: ' + progressColor + '; height: 20px; transition: width 0.3s;"></div>';
+                statusHtml += '</div>';
+                statusHtml += '</div>';
+                
+                document.getElementById('status-display').innerHTML = statusHtml;
+                document.getElementById('status-container').classList.remove('hidden');
+            }
+
+            function displayResults(data) {
+                // Request-Status anzeigen wenn verfügbar
+                if (data.request_status) {
+                    displayStatus({status: data.request_status});
+                }
+                
+                var limitsInfo = '';
+                if (data.processing_limits) {
+                    var pl = data.processing_limits;
+                    limitsInfo = '<div style="background: #fff3cd; padding: 10px; border-radius: 8px; margin: 10px 0; border-left: 4px solid #ffc107;">';
+                    limitsInfo += '<h4>📊 Verarbeitungsgrenze</h4>';
+                    limitsInfo += '<p><strong>Maximale Benutzer pro Kategorie:</strong> ' + pl.max_users_to_process + '</p>';
+                    limitsInfo += '<p><strong>Einseitige Follows:</strong> ' + pl.one_way_processed + ' von ' + pl.one_way_total + ' verarbeitet</p>';
+                    limitsInfo += '<p><strong>Nicht zurück gefolgt:</strong> ' + pl.not_following_back_processed + ' von ' + pl.not_following_back_total + ' verarbeitet</p>';
+                    limitsInfo += '</div>';
+                }
+                
+                var statsHtml = limitsInfo;
+                statsHtml += '<div class="stats">';
+                statsHtml += '<div class="stat-card">';
+                statsHtml += '<h3>' + data.stats.total_followers + '</h3>';
+                statsHtml += '<p>Follower</p>';
+                statsHtml += '</div>';
+                statsHtml += '<div class="stat-card">';
+                statsHtml += '<h3>' + data.stats.total_following + '</h3>';
+                statsHtml += '<p>Following</p>';
+                statsHtml += '</div>';
+                statsHtml += '<div class="stat-card">';
+                statsHtml += '<h3>' + data.stats.mutual_follows + '</h3>';
+                statsHtml += '<p>Gegenseitig</p>';
+                statsHtml += '</div>';
+                statsHtml += '<div class="stat-card">';
+                statsHtml += '<h3>' + data.stats.one_way_follows + '</h3>';
+                statsHtml += '<p>Einseitig</p>';
+                statsHtml += '</div>';
+                statsHtml += '<div class="stat-card">';
+                statsHtml += '<h3>' + data.stats.not_following_back + '</h3>';
+                statsHtml += '<p>Nicht zurück</p>';
+                statsHtml += '</div>';
+                statsHtml += '</div>';
+                
+                var oneWayHtml = '<h2>🔍 Einseitige Follows (' + data.one_way_follows.length + ') - ⚠️ Können entfolgt werden</h2>';
+                oneWayHtml += '<p><strong>Diese Benutzer folgen Ihnen NICHT zurück:</strong></p>';
+                oneWayHtml += '<div style="background: #fff3cd; padding: 10px; border-radius: 5px; margin: 10px 0;">';
+                oneWayHtml += '<strong>💡 Info:</strong> Diese Benutzer können beim Cleanup sicher entfolgt werden.';
+                oneWayHtml += '</div>';
+                
+                data.one_way_follows.forEach(function(user) {
+                    oneWayHtml += '<div class="user-card">';
+                    oneWayHtml += '<div class="user-header">';
+                    oneWayHtml += '<div>';
+                    oneWayHtml += '<h3><a href="' + user.html_url + '" target="_blank">' + user.username + '</a> <span style="color: #dc3545;">❌ Folgt nicht zurück</span></h3>';
+                    if (user.name) {
+                        oneWayHtml += '<p><strong>' + user.name + '</strong></p>';
+                    }
+                    if (user.bio) {
+                        oneWayHtml += '<p>' + user.bio + '</p>';
+                    }
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '<div class="user-stats">';
+                    oneWayHtml += '👥 ' + user.followers + ' Follower | ';
+                    oneWayHtml += '📤 ' + user.following + ' Following | ';
+                    oneWayHtml += '📂 ' + user.public_repos + ' Repos |';
+                    oneWayHtml += '📅 Seit ' + new Date(user.created_at).toLocaleDateString('de-DE');
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '</div>';
+                });
+                
+                oneWayHtml += '<h2>🔄 Follower ohne Rückfolgen (' + data.not_following_back.length + ') - ✅ Sicher vor Cleanup</h2>';
+                oneWayHtml += '<p><strong>Diese Benutzer folgen Ihnen, aber Sie folgen ihnen nicht zurück:</strong></p>';
+                oneWayHtml += '<div style="background: #d1edff; padding: 10px; border-radius: 5px; margin: 10px 0;">';
+                oneWayHtml += '<strong>🛡️ Sicherheit:</strong> Diese Benutzer werden NIEMALS beim Cleanup entfolgt, da sie Ihnen folgen!';
+                oneWayHtml += '</div>';
+                
+                data.not_following_back.forEach(function(user) {
+                    oneWayHtml += '<div class="user-card">';
+                    oneWayHtml += '<div class="user-header">';
+                    oneWayHtml += '<div>';
+                    oneWayHtml += '<h3><a href="' + user.html_url + '" target="_blank">' + user.username + '</a> <span style="color: #28a745;">✅ Folgt Ihnen</span></h3>';
+                    if (user.name) {
+                        oneWayHtml += '<p><strong>' + user.name + '</strong></p>';
+                    }
+                    if (user.bio) {
+                        oneWayHtml += '<p>' + user.bio + '</p>';
+                    }
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '<div class="user-stats">';
+                    oneWayHtml += '👥 ' + user.followers + ' Follower | ';
+                    oneWayHtml += '📤 ' + user.following + ' Following | ';
+                    oneWayHtml += '📂 ' + user.public_repos + ' Repos |';
+                    oneWayHtml += '📅 Seit ' + new Date(user.created_at).toLocaleDateString('de-DE');
+                    oneWayHtml += '</div>';
+                    oneWayHtml += '</div>';
+                });
                 
                 document.getElementById('stats-container').innerHTML = statsHtml;
                 document.getElementById('one-way-container').innerHTML = oneWayHtml;
@@ -342,19 +523,28 @@ def index():
             }
 
             function displayCleanupResults(data) {
-                const resultsHtml = `
-                    <div style="background: ${data.dry_run ? '#fff3cd' : '#d1edff'}; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                        <h2>${data.dry_run ? '🔍 Dry Run Ergebnisse' : '✅ Cleanup Abgeschlossen'}</h2>
-                        <p><strong>${data.processed}</strong> Benutzer verarbeitet</p>
-                        ${data.dry_run ? '<p>Kein Follow wurde tatsächlich entfernt.</p>' : '<p>Alle einseitigen Follows wurden entfernt.</p>'}
-                        <div style="margin-top: 15px;">
-                            <h3>Verarbeitete Benutzer:</h3>
-                            <ul>
-                                ${data.users.map(user => `<li>${user}</li>`).join('')}
-                            </ul>
-                        </div>
-                    </div>
-                `;
+                var bgColor = data.dry_run ? '#fff3cd' : '#d1edff';
+                var title = data.dry_run ? '🔍 Dry Run Ergebnisse' : '✅ Cleanup Abgeschlossen';
+                var actionText = data.dry_run ? 'simuliert' : 'entfolgt';
+                var conclusionText = data.dry_run ? 'Kein Follow wurde tatsächlich entfernt.' : 'Alle einseitigen Follows wurden entfernt.';
+                
+                var resultsHtml = '<div style="background: ' + bgColor + '; padding: 15px; border-radius: 8px; margin: 20px 0;">';
+                resultsHtml += '<h2>' + title + '</h2>';
+                resultsHtml += '<p><strong>' + data.processed + '</strong> einseitige Follows verarbeitet</p>';
+                resultsHtml += '<p><strong>Wichtig:</strong> Nur Benutzer, die Ihnen NICHT zurückfolgen, wurden ' + actionText + '.</p>';
+                resultsHtml += '<p>' + conclusionText + '</p>';
+                resultsHtml += '<div style="margin-top: 15px;">';
+                resultsHtml += '<h3>Verarbeitete Benutzer:</h3>';
+                resultsHtml += '<ul>';
+                
+                for (var i = 0; i < data.users.length; i++) {
+                    resultsHtml += '<li>' + data.users[i] + '</li>';
+                }
+                
+                resultsHtml += '</ul>';
+                resultsHtml += '</div>';
+                resultsHtml += '</div>';
+                
                 document.getElementById('results').innerHTML = resultsHtml;
                 document.getElementById('results').classList.remove('hidden');
             }
@@ -372,6 +562,26 @@ def index():
     </html>
     '''
 
+@app.route('/api/status')
+def api_status():
+    """API-Endpoint für den Request-Status."""
+    try:
+        username = os.getenv('GITHUB_USERNAME', 'peterruler')
+        token = os.getenv('GITHUB_TOKEN')
+        
+        if not token:
+            return jsonify({'error': 'GitHub Token nicht gefunden'}), 400
+        
+        manager = GitHubFollowManager(username, token)
+        status = manager.get_request_status()
+        
+        return jsonify({
+            'status': status,
+            'message': f"API-Requests: {status['current_requests']}/{status['max_requests']} ({status['usage_percentage']:.1f}%)"
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/analyze')
 def api_analyze():
     """API-Endpoint für die Analyse."""
@@ -384,9 +594,21 @@ def api_analyze():
         
         manager = GitHubFollowManager(username, token)
         analyzer = FollowAnalyzer(manager)
-        report = analyzer.generate_report()
         
-        return jsonify(report)
+        try:
+            report = analyzer.generate_report()
+            return jsonify(report)
+        except Exception as e:
+            if "GitHub Rate Limit erreicht" in str(e):
+                return jsonify({
+                    'error': 'GitHub Rate Limit erreicht',
+                    'message': f'Das GitHub API Rate Limit wurde erreicht. Warten Sie bis zur Reset-Zeit.',
+                    'current_requests': manager.request_count,
+                    'github_rate_limit': manager.last_rate_limit_remaining
+                }), 429
+            else:
+                return jsonify({'error': str(e)}), 500
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -406,20 +628,45 @@ def api_cleanup():
         manager = GitHubFollowManager(username, token)
         analyzer = FollowAnalyzer(manager)
         
-        one_way_follows, _, _, _ = analyzer.analyze_follows()
-        
-        processed_users = []
-        for user in one_way_follows:
-            processed_users.append(user)
-            if not dry_run:
-                success = manager.unfollow_user(user)
-                print(f"{'✅' if success else '❌'} Entfolgt: {user}")
-        
-        return jsonify({
-            'dry_run': dry_run,
-            'processed': len(processed_users),
-            'users': processed_users
-        })
+        try:
+            one_way_follows, _, _, _ = analyzer.analyze_follows()
+            
+            processed_users = []
+            for user in one_way_follows:
+                # Prüfe GitHub Rate Limit vor jedem Unfollow (nicht MAX_API_REQUESTS)
+                if manager.last_rate_limit_remaining is not None and manager.last_rate_limit_remaining <= 10:
+                    return jsonify({
+                        'error': 'GitHub Rate Limit erreicht',
+                        'message': f'Das GitHub API Rate Limit wurde erreicht.',
+                        'dry_run': dry_run,
+                        'processed': len(processed_users),
+                        'users': processed_users,
+                        'incomplete': True
+                    }), 429
+                
+                processed_users.append(user)
+                if not dry_run:
+                    success = manager.unfollow_user(user)
+                    print(f"{'✅' if success else '❌'} Entfolgt: {user}")
+            
+            return jsonify({
+                'dry_run': dry_run,
+                'processed': len(processed_users),
+                'users': processed_users,
+                'incomplete': False
+            })
+            
+        except Exception as e:
+            if "GitHub Rate Limit erreicht" in str(e):
+                return jsonify({
+                    'error': 'GitHub Rate Limit erreicht',
+                    'message': f'Das GitHub API Rate Limit wurde erreicht.',
+                    'current_requests': manager.request_count,
+                    'github_rate_limit': manager.last_rate_limit_remaining
+                }), 429
+            else:
+                return jsonify({'error': str(e)}), 500
+                
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -454,8 +701,42 @@ def main(dry_run, username, token, web, port):
         analyzer = FollowAnalyzer(manager)
         
         print("📊 Analysiere Follows...")
-        one_way_follows, mutual_follows, followers, not_following_back = analyzer.analyze_follows()
-        following = manager.get_following()
+        try:
+            one_way_follows, mutual_follows, followers, not_following_back = analyzer.analyze_follows()
+            following = manager.get_following()
+        except Exception as e:
+            if "GitHub Rate Limit erreicht" in str(e):
+                print(f"\n💡 EMPFEHLUNG:")
+                print("- Warten Sie bis das GitHub Rate Limit zurückgesetzt wird")
+                print("- Das GitHub API erlaubt 5000 Requests pro Stunde für authentifizierte Anfragen")
+                print("- Das Programm wurde sicher beendet, keine weiteren API-Requests wurden gemacht")
+                sys.exit(1)
+            else:
+                raise e
+        
+        # Request-Status anzeigen
+        status = manager.get_request_status()
+        print(f"\n📊 API REQUEST STATUS")
+        print("=" * 25)
+        print(f"Verwendete Requests: {status['current_requests']}/{status['max_requests']} ({status['usage_percentage']:.1f}%)")
+        print(f"Verbleibende Requests: {status['remaining_requests']}")
+        print(f"Max. Users zu verarbeiten: {status['max_users_to_process']}")
+        
+        # Warnung wenn fast alle Requests aufgebraucht
+        if status['remaining_requests'] <= 100:
+            print(f"⚠️  WARNUNG: Nur noch {status['remaining_requests']} Requests übrig!")
+        
+        # GitHub Rate Limit Status anzeigen falls verfügbar
+        if 'github_rate_limit' in status:
+            rl = status['github_rate_limit']
+            print(f"\n🔄 GITHUB RATE LIMIT STATUS")
+            print("=" * 30)
+            print(f"Verbleibendes Rate Limit: {rl['remaining']}/{rl['total']}")
+            print(f"Rate Limit Reset: {rl['reset_time']}")
+            
+            # Warnung bei niedrigem Rate Limit
+            if rl['remaining'] < 100:
+                print(f"⚠️  WARNUNG: Niedriges Rate Limit! Nur noch {rl['remaining']} Requests übrig.")
         
         # Report ausgeben
         print("\n📈 ZUSAMMENFASSUNG")
@@ -467,37 +748,60 @@ def main(dry_run, username, token, web, port):
         print(f"⬅️  Folgen mir, ich nicht zurück: {len(not_following_back)}")
         
         if one_way_follows:
-            print(f"\n🔍 EINSEITIGE FOLLOWS ({len(one_way_follows)})")
+            print(f"\n🔍 EINSEITIGE FOLLOWS ({len(one_way_follows)} total)")
             print("=" * 40)
-            print(f"{username} folgt diesen Benutzern, aber sie folgen nicht zurück:")
+            print(f"{username} folgt diesen Benutzern, aber sie folgen NICHT zurück:")
+            print("(Diese können beim Cleanup entfolgt werden)")
             
-            for user in sorted(one_way_follows):
+            # Begrenzt auf max_users_to_process für detaillierte Ausgabe
+            one_way_limited = list(sorted(one_way_follows))[:manager.max_users_to_process]
+            if len(one_way_limited) < len(one_way_follows):
+                print(f"📊 Zeige {len(one_way_limited)} von {len(one_way_follows)} Benutzern (Limit: {manager.max_users_to_process}):")
+            
+            for user in one_way_limited:
                 user_info = manager.get_user_info(user)
                 name = user_info.get('name', '')
                 followers_count = user_info.get('followers', 0)
                 print(f"  • {user} {f'({name})' if name else ''} - {followers_count} Follower")
+            
+            if len(one_way_limited) < len(one_way_follows):
+                remaining = len(one_way_follows) - len(one_way_limited)
+                print(f"  ... und {remaining} weitere (erhöhen Sie MAX_USERS_TO_PROCESS für vollständige Liste)")
         
         if not_following_back:
-            print(f"\n🔄 FOLLOWER OHNE RÜCKFOLGEN ({len(not_following_back)})")
+            print(f"\n🔄 FOLLOWER OHNE RÜCKFOLGEN ({len(not_following_back)} total)")
             print("=" * 50)
-            print(f"Diese Benutzer folgen {username}, aber {username} folgt nicht zurück:")
+            print(f"Diese Benutzer folgen {username}, aber {username} folgt NICHT zurück:")
+            print("(Diese werden beim Cleanup NICHT entfolgt - sie folgen Ihnen ja!)")
             
-            for user in sorted(not_following_back):
+            # Begrenzt auf max_users_to_process für detaillierte Ausgabe
+            not_following_back_limited = list(sorted(not_following_back))[:manager.max_users_to_process]
+            if len(not_following_back_limited) < len(not_following_back):
+                print(f"📊 Zeige {len(not_following_back_limited)} von {len(not_following_back)} Benutzern (Limit: {manager.max_users_to_process}):")
+            
+            for user in not_following_back_limited:
                 user_info = manager.get_user_info(user)
                 name = user_info.get('name', '')
                 followers_count = user_info.get('followers', 0)
                 print(f"  • {user} {f'({name})' if name else ''} - {followers_count} Follower")
+            
+            if len(not_following_back_limited) < len(not_following_back):
+                remaining = len(not_following_back) - len(not_following_back_limited)
+                print(f"  ... und {remaining} weitere (erhöhen Sie MAX_USERS_TO_PROCESS für vollständige Liste)")
             
             if dry_run:
                 print(f"\n🔍 DRY RUN MODUS")
                 print("=" * 20)
-                print(f"Würde {len(one_way_follows)} Benutzer entfolgen:")
+                print(f"Würde {len(one_way_follows)} einseitige Follows entfolgen:")
+                print("(Nur Benutzer, die Ihnen NICHT zurückfolgen)")
                 for user in sorted(one_way_follows):
                     print(f"  • Würde {user} entfolgen")
             else:
                 print(f"\n⚠️  CLEANUP DURCHFÜHREN")
                 print("=" * 25)
-                confirm = input(f"Möchten Sie wirklich {len(one_way_follows)} Benutzer entfolgen? (ja/nein): ")
+                print("WICHTIG: Es werden nur Benutzer entfolgt, die Ihnen NICHT zurückfolgen!")
+                print("Benutzer, die Ihnen folgen, werden NICHT entfolgt.")
+                confirm = input(f"Möchten Sie wirklich {len(one_way_follows)} einseitige Follows entfolgen? (ja/nein): ")
                 
                 if confirm.lower() in ['ja', 'j', 'yes', 'y']:
                     successful = 0

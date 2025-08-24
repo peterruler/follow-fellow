@@ -167,6 +167,52 @@ Bei Problemen oder Fragen:
 3. Prüfen Sie Ihre Internetverbindung
 4. Erstellen Sie ein Issue in diesem Repository
 
+## 🧪 Tests
+
+Das Projekt verfügt über umfassende Tests mit pytest. Weitere Details in [TESTING.md](TESTING.md).
+
+### Tests ausführen
+
+**Alle Tests:**
+```bash
+pytest
+```
+
+**Mit Coverage-Report:**
+```bash
+pytest --cov=follow_fellow --cov-report=html
+```
+
+**Spezifische Tests:**
+```bash
+# Nur Unit-Tests
+pytest test_follow_fellow.py::TestGitHubFollowManager
+
+# Nur API-Tests  
+pytest test_follow_fellow.py::TestFlaskApp
+
+# Mit Details
+pytest -v
+
+# Bis zum ersten Fehler
+pytest -x
+```
+
+### Test-Dependencies installieren
+
+```bash
+pip install pytest pytest-cov pytest-mock
+```
+
+### Coverage-Ziele
+
+- ✅ Gesamt-Coverage: > 90%
+- ✅ GitHubFollowManager: > 95%
+- ✅ FollowAnalyzer: > 95%
+- ✅ Flask API: 100%
+
+Siehe [TESTING.md](TESTING.md) für detaillierte Test-Dokumentation.
+
 ## 🔧 Entwicklung
 
 Für lokale Entwicklung:
@@ -175,11 +221,17 @@ Für lokale Entwicklung:
 # Development Server mit Debug-Modus
 python follow_fellow.py --web
 
-# Tests ausführen (falls vorhanden)
-python -m pytest
+# Tests ausführen
+pytest
+
+# Tests mit Coverage
+pytest --cov=follow_fellow --cov-report=html
 
 # Code-Stil prüfen
 flake8 follow_fellow.py
+
+# Alle Tests in Überwachungsmodus
+pytest --cov=follow_fellow --cov-report=term-missing -v
 ```
 
 ## 📈 Zukünftige Features
